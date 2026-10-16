@@ -1,0 +1,27 @@
+[package]
+name = "Alexandria"
+version = "0.1.1"
+edition = "2021"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["ico"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "persistence"] }
+serde = { version = "1", features = ["derive"] }
+jwalk = "0.8"
+trash = "5"
+opener = "0.7"
+dirs = "6"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[target.'cfg(windows)'.dependencies]
+window-vibrancy = "0.6"
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[build-dependencies]
+winres = "0.1"
