@@ -4,8 +4,30 @@
 
 use eframe::egui::{self, pos2, vec2, Color32, CornerRadius, Painter, Pos2, Rect, Shape, Stroke};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 pub const R0: CornerRadius = CornerRadius::ZERO;
+
+/// Minimum widths of the file table columns: Name, Date modified, Type, Size.
+/// Columns can be resized but never shrink below these, so none can disappear.
+pub const MIN_COLS: [f32; 4] = [120.0, 96.0, 72.0, 64.0];
+pub const DEFAULT_COLS: [f32; 4] = [300.0, 140.0, 110.0, 84.0];
+
+pub fn default_quick() -> Vec<(String, PathBuf)> {
+    let mut v: Vec<(String, PathBuf)> = Vec::new();
+    let mut add = |n: &str, p: Option<PathBuf>| {
+        if let Some(p) = p {
+            v.push((n.to_string(), p));
+        }
+    };
+    add("Desktop", dirs::desktop_dir());
+    add("Downloads", dirs::download_dir());
+    add("Documents", dirs::document_dir());
+    add("Pictures", dirs::picture_dir());
+    add("Music", dirs::audio_dir());
+    add("Videos", dirs::video_dir());
+    v
+}
 
 pub const ACCENTS: [[u8; 3]; 8] = [
     [0, 120, 215],
@@ -18,9 +40,19 @@ pub const ACCENTS: [[u8; 3]; 8] = [
     [104, 118, 138],
 ];
 
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ThemeMode {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub theme_mode: ThemeMode,
+    /// The theme currently in effect (resolved from `theme_mode` and the OS setting every frame).
     pub dark: bool,
     pub accent: [u8; 3],
     pub acrylic: bool,
@@ -29,11 +61,14 @@ pub struct Settings {
     pub show_sidebar: bool,
     pub confirm_delete: bool,
     pub compact: bool,
+    pub cols: [f32; 4],
+    pub quick: Vec<(String, PathBuf)>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            theme_mode: ThemeMode::System,
             dark: false,
             accent: ACCENTS[0],
             acrylic: false,
@@ -42,6 +77,8 @@ impl Default for Settings {
             show_sidebar: true,
             confirm_delete: true,
             compact: false,
+            cols: DEFAULT_COLS,
+            quick: default_quick(),
         }
     }
 }
@@ -123,11 +160,8 @@ pub fn palette(s: &Settings) -> Palette {
     }
 }
 
-pub fn apply_visuals(ctx: &egui::Context, s: &Settings) {
+fn visuals_for(s: &Settings) -> egui::Visuals {
     let p = palette(s);
-    let theme = if s.dark { egui::Theme::Dark } else { egui::Theme::Light };
-    ctx.set_theme(theme);
-
     let mut v = if s.dark { egui::Visuals::dark() } else { egui::Visuals::light() };
     v.panel_fill = Color32::TRANSPARENT; // the app paints every surface itself
     v.window_fill = if s.dark { rgb(0x2B2B2B) } else { Color32::WHITE };
@@ -165,7 +199,22 @@ pub fn apply_visuals(ctx: &egui::Context, s: &Settings) {
     v.widgets.active.weak_bg_fill = btn_a;
     v.widgets.active.bg_fill = btn_a;
     v.widgets.active.bg_stroke = Stroke::new(1.0, p.accent);
-    ctx.set_visuals_of(theme, v);
+    v
+}
+
+/// Installs both the light and the dark style and lets egui pick between them, so
+/// "System" follows the OS theme (including live changes) without any polling.
+pub fn apply_visuals(ctx: &egui::Context, s: &Settings) {
+    for dark in [false, true] {
+        let mut t = s.clone();
+        t.dark = dark;
+        ctx.set_visuals_of(if dark { egui::Theme::Dark } else { egui::Theme::Light }, visuals_for(&t));
+    }
+    ctx.set_theme(match s.theme_mode {
+        ThemeMode::System => egui::ThemePreference::System,
+        ThemeMode::Light => egui::ThemePreference::Light,
+        ThemeMode::Dark => egui::ThemePreference::Dark,
+    });
 
     ctx.all_styles_mut(|st| {
         use egui::{FontId, TextStyle as T};

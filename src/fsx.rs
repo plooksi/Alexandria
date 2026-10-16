@@ -18,7 +18,7 @@ use std::{
 
 use eframe::egui;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Entry {
     pub name: String,
     pub name_lc: String,
@@ -28,6 +28,7 @@ pub struct Entry {
     pub modified: Option<SystemTime>,
     pub hidden: bool,
     pub kind: String,
+    pub ext: String, // lowercase extension, used for icon lookup
 }
 
 #[cfg(windows)]
@@ -57,6 +58,11 @@ impl Entry {
                 None => "File".to_string(),
             }
         };
+        let ext = if is_dir {
+            String::new()
+        } else {
+            path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default()
+        };
         let size = if is_dir { 0 } else { md.map_or(0, |m| m.len()) };
         let modified = md.and_then(|m| m.modified().ok());
         Entry {
@@ -68,6 +74,7 @@ impl Entry {
             modified,
             hidden,
             kind,
+            ext,
         }
     }
 }
@@ -113,8 +120,31 @@ impl Drop for SearchHandle {
 
 pub const MAX_RESULTS: usize = 100_000;
 
-/// Recursive, case-insensitive name search using jwalk's parallel walker.
-/// Plain text = substring match; `*` and `?` switch to wildcard matching.
+thread_local! {
+    static LC: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+}
+
+/// Case-insensitive match without allocating per file (reuses a per-thread buffer).
+fn name_matches(name: &str, q_str: &str, q: &[char], wild: bool) -> bool {
+    LC.with(|b| {
+        let mut b = b.borrow_mut();
+        b.clear();
+        for c in name.chars() {
+            b.extend(c.to_lowercase());
+        }
+        if wild {
+            let t: Vec<char> = b.chars().collect();
+            wildcard(q, &t)
+        } else {
+            b.contains(q_str)
+        }
+    })
+}
+
+/// Recursive, case-insensitive name search. The walk, the name matching and the
+/// metadata lookup of every hit all run inside jwalk's worker threads (an oversized
+/// pool, since directory walking is I/O-latency bound); this thread only batches
+/// results for the UI. Plain text = substring match; `*` and `?` mean wildcards.
 pub fn spawn_search(root: PathBuf, query: String, ctx: egui::Context) -> SearchHandle {
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -123,19 +153,41 @@ pub fn spawn_search(root: PathBuf, query: String, ctx: egui::Context) -> SearchH
         let q_str = query.to_lowercase();
         let q: Vec<char> = q_str.chars().collect();
         let wild = q.iter().any(|c| *c == '*' || *c == '?');
+        let threads = thread::available_parallelism().map_or(8, |n| n.get() * 2).clamp(4, 32);
+        let cancel_w = flag.clone();
+
+        let walker = jwalk::WalkDirGeneric::<((), Option<Entry>)>::new(&root)
+            .skip_hidden(false)
+            .follow_links(false)
+            .sort(false)
+            .parallelism(jwalk::Parallelism::RayonNewPool(threads))
+            .process_read_dir(move |_depth, _path, _state, children| {
+                if cancel_w.load(AO::Relaxed) {
+                    children.clear(); // stop descending once cancelled
+                    return;
+                }
+                for child in children.iter_mut().flatten() {
+                    let (hit, owned) = {
+                        let lossy = child.file_name().to_string_lossy();
+                        let hit = name_matches(&lossy, &q_str, &q, wild);
+                        (hit, if hit { Some(lossy.into_owned()) } else { None })
+                    };
+                    if let (true, Some(name)) = (hit, owned) {
+                        let md = child.metadata().ok();
+                        let path = child.path();
+                        child.client_state = Some(Entry::new(path, name, md.as_ref()));
+                    }
+                }
+            });
+
         let mut batch: Vec<Entry> = Vec::with_capacity(512);
         let mut total = 0usize;
         let mut last = Instant::now();
         let mut truncated = false;
 
-        let walker = jwalk::WalkDir::new(&root)
-            .skip_hidden(false)
-            .follow_links(false)
-            .sort(false);
-
         for res in walker {
             if flag.load(AO::Relaxed) {
-                return;
+                return; // dropping the iterator stops the walk
             }
             if !batch.is_empty() && last.elapsed() >= Duration::from_millis(60) {
                 if tx.send(SearchMsg::Batch(std::mem::take(&mut batch))).is_err() {
@@ -144,34 +196,21 @@ pub fn spawn_search(root: PathBuf, query: String, ctx: egui::Context) -> SearchH
                 ctx.request_repaint();
                 last = Instant::now();
             }
-            let Ok(de) = res else { continue };
-            if de.depth() == 0 {
-                continue;
-            }
-            let name = de.file_name().to_string_lossy().into_owned();
-            let lc = name.to_lowercase();
-            let hit = if wild {
-                let t: Vec<char> = lc.chars().collect();
-                wildcard(&q, &t)
-            } else {
-                lc.contains(&q_str)
-            };
-            if !hit {
-                continue;
-            }
-            let md = de.metadata().ok();
-            batch.push(Entry::new(de.path(), name, md.as_ref()));
-            total += 1;
-            if batch.len() >= 512 {
-                if tx.send(SearchMsg::Batch(std::mem::take(&mut batch))).is_err() {
-                    return;
+            let Ok(mut de) = res else { continue };
+            if let Some(e) = de.client_state.take() {
+                batch.push(e);
+                total += 1;
+                if batch.len() >= 512 {
+                    if tx.send(SearchMsg::Batch(std::mem::take(&mut batch))).is_err() {
+                        return;
+                    }
+                    ctx.request_repaint();
+                    last = Instant::now();
                 }
-                ctx.request_repaint();
-                last = Instant::now();
-            }
-            if total >= MAX_RESULTS {
-                truncated = true;
-                break;
+                if total >= MAX_RESULTS {
+                    truncated = true;
+                    break;
+                }
             }
         }
         if !flag.load(AO::Relaxed) {
@@ -320,6 +359,41 @@ fn copy_recursive(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Cross-volume move: copy, verify, and only then delete the source. A failed or
+/// unverified copy leaves the source untouched and cleans up the partial destination.
+fn move_across_volumes(src: &Path, dst: &Path) -> io::Result<()> {
+    fn tree(p: &Path) -> io::Result<(u64, u64)> {
+        let md = fs::symlink_metadata(p)?;
+        if md.is_dir() {
+            let (mut bytes, mut count) = (0, 0);
+            for e in fs::read_dir(p)? {
+                let (b, c) = tree(&e?.path())?;
+                bytes += b;
+                count += c;
+            }
+            Ok((bytes, count))
+        } else {
+            Ok((md.len(), 1))
+        }
+    }
+    let cleanup = |dst: &Path| {
+        let _ = if dst.is_dir() { fs::remove_dir_all(dst) } else { fs::remove_file(dst) };
+    };
+    if let Err(e) = copy_recursive(src, dst) {
+        cleanup(dst);
+        return Err(e);
+    }
+    if tree(src)? != tree(dst)? {
+        cleanup(dst);
+        return Err(io::Error::new(io::ErrorKind::Other, "copy could not be verified; source kept"));
+    }
+    if src.is_dir() {
+        fs::remove_dir_all(src)
+    } else {
+        fs::remove_file(src)
+    }
+}
+
 fn summarize(verb: &str, ok: usize, errs: Vec<String>) -> Result<String, String> {
     if errs.is_empty() {
         Ok(format!("{verb} {ok} item{}", if ok == 1 { "" } else { "s" }))
@@ -359,14 +433,7 @@ pub fn run_op(op: Op) -> Result<String, String> {
                 if dst.exists() {
                     dst = unique_dest(&dest, src);
                 }
-                let r = fs::rename(src, &dst).or_else(|_| {
-                    copy_recursive(src, &dst)?;
-                    if src.is_dir() {
-                        fs::remove_dir_all(src)
-                    } else {
-                        fs::remove_file(src)
-                    }
-                });
+                let r = fs::rename(src, &dst).or_else(|_| move_across_volumes(src, &dst));
                 match r {
                     Ok(()) => ok += 1,
                     Err(e) => errs.push(format!("{}: {e}", src.display())),

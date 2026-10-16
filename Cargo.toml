@@ -1,9 +1,11 @@
 [package]
 name = "Alexandria"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
+serde_json = "1"
+drag = "2"
 image = { version = "0.25", default-features = false, features = ["ico"] }
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "persistence"] }
 serde = { version = "1", features = ["derive"] }
@@ -15,7 +17,16 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 
 [target.'cfg(windows)'.dependencies]
 window-vibrancy = "0.6"
-windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }
 
 [profile.release]
 opt-level = 3
